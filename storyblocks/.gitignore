@@ -1,0 +1,6 @@
+*_timestamp
+*_sha
+model.tar.gz
+
+/face_detection/model/code/DSFD-Pytorch-Inference
+/object_detection/model/code/Yet-Another-EfficientDet-Pytorch
