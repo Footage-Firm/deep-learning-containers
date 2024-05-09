@@ -8,12 +8,12 @@ MODEL_DIR=${DIR}/model
 CODE_DIR=${MODEL_DIR}/code
 
 cd "${CODE_DIR}" || exit
-git clone https://github.com/hukkelas/DSFD-Pytorch-Inference.git
+git clone https://github.com/Footage-Firm/DSFD-Pytorch-Inference.git
 cd DSFD-Pytorch-Inference
 
 # note: this is the last commit before they started requesting pytorch>=1.6,
 # so don't update the repo unless you intend to use the 1.6 container
-git checkout 36fda4eaf
+git checkout 0809497
 
 cd "${HERE}" || exit
 
