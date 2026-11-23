@@ -14,13 +14,15 @@ import datetime
 import json
 import os
 import sys
-import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+import cv2
+import numpy as np
 import torch
 import yaml
 
-from sagemaker_inference import content_types, errors
+from sagemaker_inference import content_types, encoder, errors
 
 # path munging to access the neighboring YAEDP repo
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -29,20 +31,32 @@ sys.path.insert(0, YAEDP_ROOT)
 
 from backbone import EfficientDetBackbone
 from efficientdet.utils import BBoxTransform, ClipBoxes
-from utils.utils import invert_affine, postprocess, preprocess
+from utils.utils import invert_affine, postprocess, preprocess_video
 
 # model version is chosen at model startup from the invocation arguments
 EFFICIENTDET_COMPOUND_COEF = int(os.environ.get('EFFICIENTDET_COMPOUND_COEF', 0))
 DEFAULT_PRED_THRESHOLD = float(os.environ.get('DEFAULT_PRED_THRESHOLD', 0.05))
 DEFAULT_IOU_THRESHOLD = float(os.environ.get('DEFAULT_IOU_THRESHOLD', 0.5))
 USE_FLOAT16 = os.environ.get('USE_FLOAT16', 'false') == 'true'
+# jsonlines requests (batch transform MultiRecord) can carry hundreds of frames. this many go
+# through the model at once; raise it until the gpu runs out of memory with the configured number
+# of model server workers
+GPU_BATCH_SIZE = int(os.environ.get('GPU_BATCH_SIZE', 4))
+# frames in a jsonlines request are downloaded from s3 in parallel
+S3_DOWNLOAD_THREADS = int(os.environ.get('S3_DOWNLOAD_THREADS', 16))
+JSONLINES = 'application/jsonlines'
 
 print(f"EFFICIENTDET_COMPOUND_COEF = {EFFICIENTDET_COMPOUND_COEF}")
 print(f"DEFAULT_PRED_THRESHOLD = {DEFAULT_PRED_THRESHOLD}")
 print(f"DEFAULT_IOU_THRESHOLD = {DEFAULT_IOU_THRESHOLD}")
 print(f"USE_FLOAT16 = {USE_FLOAT16}")
+print(f"GPU_BATCH_SIZE = {GPU_BATCH_SIZE}")
+print(f"S3_DOWNLOAD_THREADS = {S3_DOWNLOAD_THREADS}")
 
 USE_CUDA = torch.cuda.is_available()
+
+# boto3 clients are thread safe; one per model server worker avoids re-creating it per frame
+S3 = boto3.client('s3')
 
 print(f'USE_CUDA = {USE_CUDA}')
 
@@ -139,9 +153,12 @@ def timer(func):
 
 
 @timer
-def model_fn(model_dir):
+def model_fn(model_dir, context=None):
     # based entirely off of
     # https://github.com/zylo117/Yet-Another-EfficientDet-Pytorch/blob/master/coco_eval.py
+    # model_archive_build.sh bundles the weights into model_dir, where load_state_dict_from_url
+    # finds them without downloading. without them, every model server worker on every instance
+    # downloads from github on startup
     print(f'building and loading efficientdet d{EFFICIENTDET_COMPOUND_COEF}')
     model = EfficientDetBackbone(compound_coef=EFFICIENTDET_COMPOUND_COEF,
                                  num_classes=len(PARAMS['obj_list']),
@@ -164,23 +181,40 @@ def model_fn(model_dir):
     return model
 
 
-def load_s3_image_and_preprocess(bucket, key):
-    """download the file from s3, process it using the external library
+def load_s3_image(bucket_and_key):
+    """download an image from s3 and decode it the same way cv2.imread would
+
+    Args:
+        bucket_and_key: tuple of (bucket, key)
+
+    Returns:
+        np.ndarray: the image as a cv2 (BGR) array
+
+    """
+    bucket, key = bucket_and_key
+    body = S3.get_object(Bucket=bucket, Key=key)['Body'].read()
+    img = cv2.imdecode(np.frombuffer(body, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise StoryblocksCustomError(f"could not decode image s3://{bucket}/{key}")
+    return img
+
+
+def load_s3_images_and_preprocess(bucket_keys):
+    """download the files from s3 in parallel, process them using the external library
 
     returns:
-        ori_imgs (list of np.ndarray) the original image as a cv2 np array
+        ori_imgs (list of np.ndarray) the original images as cv2 np arrays
         framed_imgs (list of np.ndarray) a resized and rescaled version of each image in ori_imgs
         framed_metas (list of tuples) a list of tuples of scaling information, where each tuple
             has components new_w, new_h, old_w, old_h, padding_w, padding_h
 
     """
-    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(key)[1]) as ntf:
-        s3 = boto3.client('s3')
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        with open(ntf.name, 'wb') as fp:
-            fp.write(obj['Body'].read())
+    with ThreadPoolExecutor(max_workers=S3_DOWNLOAD_THREADS) as pool:
+        imgs = list(pool.map(load_s3_image, bucket_keys))
 
-        return preprocess(ntf.name, max_size=MAX_INPUT_SIZE, mean=PARAMS['mean'], std=PARAMS['std'])
+    # preprocess_video is preprocess for in-memory images; mean and std are passed explicitly
+    # because its defaults are in a different channel order
+    return preprocess_video(*imgs, max_size=MAX_INPUT_SIZE, mean=PARAMS['mean'], std=PARAMS['std'])
 
 
 def parse_json_input(input_data):
@@ -241,19 +275,33 @@ def input_fn(input_data, content_type):
         iou_threshold (float): threshold for iou filtering in nms postprocessing of detections
 
     """
-    # todo: can we support multiple input files?
     if content_type == content_types.CSV:
         i = input_data.find('/')
-        bucket, key = input_data[:i], input_data[i + 1:]
-        pred_threshold = DEFAULT_PRED_THRESHOLD
-        iou_threshold = DEFAULT_IOU_THRESHOLD
+        records = [(input_data[:i], input_data[i + 1:], DEFAULT_PRED_THRESHOLD,
+                    DEFAULT_IOU_THRESHOLD)]
     elif content_type == content_types.JSON:
-        bucket, key, pred_threshold, iou_threshold = parse_json_input(input_data)
+        records = [parse_json_input(input_data)]
+    elif content_type == JSONLINES:
+        records = [parse_json_input(line) for line in _decode(input_data).splitlines()
+                   if line.strip()]
     else:
         raise errors.UnsupportedFormatError(content_type)
 
-    ori_imgs, framed_imgs, framed_metas = load_s3_image_and_preprocess(bucket=bucket, key=key)
+    # postprocess applies one threshold pair to the whole batch
+    thresholds = {(pred_threshold, iou_threshold) for (_, _, pred_threshold, iou_threshold)
+                  in records}
+    if len(thresholds) != 1:
+        raise StoryblocksCustomError(
+            "every record in a jsonlines request must use the same threshold values")
+    (pred_threshold, iou_threshold), = thresholds
+
+    bucket_keys = [(bucket, key) for (bucket, key, _, _) in records]
+    ori_imgs, framed_imgs, framed_metas = load_s3_images_and_preprocess(bucket_keys)
     return ori_imgs, framed_imgs, framed_metas, pred_threshold, iou_threshold
+
+
+def _decode(input_data):
+    return input_data.decode('utf-8') if isinstance(input_data, (bytes, bytearray)) else input_data
 
 
 @timer
@@ -265,10 +313,19 @@ def predict_fn(data, model):
         data: tuple of inputs generated by custom input_fn above
         model: PyTorch model loaded in memory by model_fn
 
-    Returns: a prediction
+    Returns: a list with one detections dict per input image
 
     """
     ori_imgs, framed_imgs, framed_metas, threshold, iou_threshold = data
+    out = []
+    for start in range(0, len(framed_imgs), GPU_BATCH_SIZE):
+        end = start + GPU_BATCH_SIZE
+        out.extend(_predict_batch(model, framed_imgs[start:end], framed_metas[start:end],
+                                  threshold, iou_threshold))
+    return out
+
+
+def _predict_batch(model, framed_imgs, framed_metas, threshold, iou_threshold):
     x = torch.stack(
         [torch.from_numpy(fi).cuda() if USE_CUDA else torch.from_numpy(fi)
          for fi in framed_imgs],
@@ -292,3 +349,22 @@ def predict_fn(data, model):
                           iou_threshold=iou_threshold)
         out = invert_affine(framed_metas, out)
         return out
+
+
+def output_fn(prediction, accept):
+    """jsonlines responses have one line per input image, so batch transform can join each line
+    back to its input record. each line is a one-element list, the same shape a single-image json
+    response has, so downstream parsing is identical for both batch strategies
+
+    Args:
+        prediction: the list of detection dicts from predict_fn
+        accept: the requested response content type
+
+    Returns:
+        str: the serialized response
+
+    """
+    if accept == JSONLINES:
+        return '\n'.join(encoder.encode([detections], content_types.JSON)
+                         for detections in prediction)
+    return encoder.encode(prediction, accept)
