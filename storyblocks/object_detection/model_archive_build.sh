@@ -15,6 +15,19 @@ echo "${YAEDP_CURRENT_SHA}" > yaefd_current_sha
 # add a timestamp while we are here
 date -u +"%Y%m%dT%H%M%S" > model_archive_timestamp
 
+# bundle the pretrained weights so model_fn loads them from the model dir instead of every model
+# server worker downloading them from github at startup. the urls must match get_weights_url in
+# inference.py; pass WEIGHT_COEFS="0 4" etc. to bundle other compound coefficients
+WEIGHT_COEFS=${WEIGHT_COEFS:-4}
+WEIGHTS_RELEASE_URL="https://github.com/zylo117/Yet-Another-Efficient-Pytorch/releases/download/1.0"
+for COEF in ${WEIGHT_COEFS}; do
+    WEIGHTS_FILE="${MODEL_DIR}/efficientdet-d${COEF}.pth"
+    if [ ! -f "${WEIGHTS_FILE}" ] ; then
+        curl --fail --location --output "${WEIGHTS_FILE}" \
+            "${WEIGHTS_RELEASE_URL}/efficientdet-d${COEF}.pth" || exit 1
+    fi
+done
+
 # create the archive
 cd "${MODEL_DIR}" || exit
 if [ -f "model.tar.gz" ] ; then
